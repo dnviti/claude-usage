@@ -1,0 +1,21 @@
+.claude-usage-panel-label { font-feature-settings: "tnum"; }
+.claude-usage-panel-label.claude-usage-warning { color: #f8e45c; }
+.claude-usage-panel-label.claude-usage-critical { color: #ff7b63; }
+
+.claude-usage-heading { font-weight: bold; }
+.claude-usage-dim { color: #9a9996; }
+.claude-usage-error { color: #ff7b63; font-weight: bold; }
+
+.claude-usage-row { spacing: 4px; min-width: 260px; }
+.claude-usage-pct { font-weight: bold; font-feature-settings: "tnum"; padding-left: 12px; }
+.claude-usage-detail { color: #9a9996; font-size: 0.85em; }
+
+.claude-usage-trough {
+  height: 6px;
+  border-radius: 3px;
+  background-color: rgba(128, 128, 128, 0.35);
+}
+.claude-usage-fill { height: 6px; border-radius: 3px; }
+.claude-usage-fill-normal { background-color: -st-accent-color; }
+.claude-usage-fill-warning { background-color: #e5a50a; }
+.claude-usage-fill-critical { background-color: #e01b24; }

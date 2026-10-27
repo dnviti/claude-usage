@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Claude Usage
+Comment=Claude Code usage statistics and subscription limits
+Exec=claude-usage
+Icon=org.gnome.SystemMonitor.Devel
+Terminal=false
+Categories=System;Monitor;GTK;
+StartupNotify=true

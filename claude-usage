@@ -1,0 +1,1096 @@
+#!/usr/bin/env python3
+"""Claude Usage - statistiche di utilizzo di Claude Code (GTK4 + libadwaita).
+
+Legge le trascrizioni JSONL in ~/.claude/projects/**/*.jsonl, deduplica le voci
+(message.id + requestId) e mostra totali, ripartizione per modello/progetto,
+grafico giornaliero e un costo STIMATO.
+
+Mostra anche i LIMITI dell'abbonamento Claude (sessione di 5 ore, settimanali,
+per modello...) letti dallo stesso endpoint usato da `/usage` in Claude Code:
+GET https://api.anthropic.com/api/oauth/usage con il token OAuth di
+~/.claude/.credentials.json. Il token viene solo letto (mai rinnovato, mai
+stampato, mai salvato) e inviato solo ad api.anthropic.com.
+
+Uso:
+    claude-usage                  avvia l'interfaccia grafica
+    claude-usage --dump           stampa le statistiche su terminale (senza GUI)
+    claude-usage --limits         stampa i limiti dell'abbonamento (senza GUI)
+    claude-usage --limits --json  idem in JSON (usato dall'estensione GNOME)
+    claude-usage --version        stampa la versione
+"""
+
+__version__ = "0.1.0"
+
+# ---------------------------------------------------------------------------
+# TABELLA PREZZI (MODIFICABILE) - USD per milione di token.
+#
+# ATTENZIONE: i costi mostrati sono solo una STIMA indicativa basata su questi
+# prezzi di listino, che puoi correggere liberamente. Non e' una fatturazione:
+# abbonamenti, sconti, tier di prezzo (es. prompt lunghi) e modelli non
+# elencati non sono considerati.
+#
+# Chiave = prefisso dell'ID modello (vince il prefisso piu' lungo).
+# cw5 = scrittura cache 5 minuti, cw1h = scrittura cache 1 ora.
+# ---------------------------------------------------------------------------
+PRICES = {
+    #                     input   output   cw5    cw1h   cache read
+    "claude-opus-5-5":   dict(inp=4.00,  out=20.00, cw5=5.00,  cw1h=8.00,  cr=0.20),
+    "claude-opus-5":     dict(inp=5.00,  out=25.00, cw5=6.25,  cw1h=10.00, cr=0.50),
+    "claude-opus-4":     dict(inp=5.00,  out=25.00, cw5=6.25,  cw1h=10.00, cr=0.50),
+    "claude-sonnet-5":   dict(inp=2.00,  out=10.00, cw5=2.50,  cw1h=4.00,  cr=0.20),
+    "claude-sonnet-4":   dict(inp=3.00,  out=15.00, cw5=3.75,  cw1h=6.00,  cr=0.30),
+    "claude-haiku-5":    dict(inp=0.10,  out=0.50,  cw5=0.125, cw1h=0.20,  cr=0.01),
+    "claude-haiku-4":    dict(inp=1.00,  out=5.00,  cw5=1.25,  cw1h=2.00,  cr=0.10),
+    "claude-fable-5":    dict(inp=10.00, out=50.00, cw5=12.50, cw1h=20.00, cr=0.25),
+    "claude-mythos-5":   dict(inp=10.00, out=50.00, cw5=12.50, cw1h=20.00, cr=0.25),
+}
+# ---------------------------------------------------------------------------
+
+import http.client
+import json
+import os
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
+
+APP_ID = "io.github.dnviti.ClaudeUsage"
+PROJECTS_DIR = os.path.expanduser("~/.claude/projects")
+FIELDS = ("inp", "out", "cw5", "cw1h", "cr")
+
+# cache per file: path -> (mtime_ns, size, records)
+_file_cache = {}
+
+
+def price_for(model):
+    best = None
+    for key in PRICES:
+        if model.startswith(key) and (best is None or len(key) > len(best)):
+            best = key
+    return PRICES[best] if best else None
+
+
+def cost_of(model, r):
+    p = price_for(model)
+    if not p:
+        return 0.0
+    return sum(r[f] * p[f] for f in FIELDS) / 1_000_000
+
+
+def decode_dirname(name):
+    """Fallback: decodifica ambigua del nome cartella (i '-' di path e nomi si confondono)."""
+    path = "/" + name.lstrip("-").replace("-", "/")
+    home = os.path.expanduser("~")
+    if path.startswith(home):
+        path = "~" + path[len(home):]
+    return path
+
+
+def pretty_path(p):
+    home = os.path.expanduser("~")
+    if p == home:
+        return "~"
+    if p.startswith(home + "/"):
+        return "~" + p[len(home):]
+    return p
+
+
+def _parse_file(path):
+    """Restituisce {key: record} per un file; i chunk ripetuti si fondono prendendo il massimo."""
+    out = {}
+    cwd = None
+    try:
+        fh = open(path, encoding="utf-8", errors="replace")
+    except OSError:
+        return out, None
+    with fh:
+        for line in fh:
+            if '"usage"' not in line and '"cwd"' not in line:
+                continue
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            if cwd is None and isinstance(d.get("cwd"), str):
+                cwd = d["cwd"]
+            if d.get("type") != "assistant":
+                continue
+            m = d.get("message") or {}
+            u = m.get("usage")
+            model = m.get("model")
+            if not isinstance(u, dict) or not model or model.startswith("<"):
+                continue
+            ts = d.get("timestamp")
+            if not ts:
+                continue
+            try:
+                dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            cc = u.get("cache_creation") or {}
+            cw5 = cc.get("ephemeral_5m_input_tokens")
+            cw1h = cc.get("ephemeral_1h_input_tokens")
+            total_cw = u.get("cache_creation_input_tokens") or 0
+            if cw5 is None and cw1h is None:
+                cw5, cw1h = total_cw, 0
+            else:
+                cw5, cw1h = cw5 or 0, cw1h or 0
+            rec = dict(
+                dt=dt, model=model,
+                inp=u.get("input_tokens") or 0,
+                out=u.get("output_tokens") or 0,
+                cw5=cw5, cw1h=cw1h,
+                cr=u.get("cache_read_input_tokens") or 0,
+            )
+            mid, rid = m.get("id"), d.get("requestId")
+            key = (mid, rid) if (mid or rid) else ("uuid", d.get("uuid") or id(d))
+            old = out.get(key)
+            if old:
+                for f in FIELDS:
+                    rec[f] = max(rec[f], old[f])
+                rec["dt"] = min(rec["dt"], old["dt"])
+            out[key] = rec
+    return out, cwd
+
+
+def collect(since=None):
+    """Scansiona tutto e restituisce (lista record deduplicati, info).
+
+    Con `since` (timestamp) salta i file non modificati da allora: utile per
+    calcolare solo "oggi" senza leggere tutto lo storico.
+    """
+    seen_paths = set()
+    merged = {}
+    proj_names = {}
+    nfiles = 0
+    for root, _dirs, files in os.walk(PROJECTS_DIR):
+        rel = os.path.relpath(root, PROJECTS_DIR)
+        proj_dir = rel.split(os.sep)[0]
+        for fn in files:
+            if not fn.endswith(".jsonl"):
+                continue
+            path = os.path.join(root, fn)
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            seen_paths.add(path)
+            if since is not None and st.st_mtime < since:
+                continue
+            c = _file_cache.get(path)
+            if c and c[0] == st.st_mtime_ns and c[1] == st.st_size:
+                recs, cwd = c[2], c[3]
+            else:
+                recs, cwd = _parse_file(path)
+                _file_cache[path] = (st.st_mtime_ns, st.st_size, recs, cwd)
+            nfiles += 1
+            if cwd and proj_dir not in proj_names:
+                proj_names[proj_dir] = pretty_path(cwd)
+            for key, rec in recs.items():
+                if key in merged:
+                    old = merged[key]
+                    for f in FIELDS:
+                        old["rec"][f] = max(old["rec"][f], rec[f])
+                else:
+                    merged[key] = {"rec": dict(rec), "proj": proj_dir}
+    for p in list(_file_cache):
+        if p not in seen_paths:
+            del _file_cache[p]
+    records = []
+    for v in merged.values():
+        r = v["rec"]
+        r["project"] = proj_names.get(v["proj"]) or decode_dirname(v["proj"])
+        r["day"] = r["dt"].astimezone().date()
+        r["cost"] = cost_of(r["model"], r)
+        records.append(r)
+    return records, {"files": nfiles}
+
+
+def blank():
+    return dict(n=0, inp=0, out=0, cw5=0, cw1h=0, cr=0, cost=0.0)
+
+
+def add(acc, r):
+    acc["n"] += 1
+    for f in FIELDS:
+        acc[f] += r[f]
+    acc["cost"] += r["cost"]
+
+
+def compute(records):
+    today = datetime.now().astimezone().date()
+    periods = {"today": 0, "7d": 6, "30d": 29, "all": None}
+    totals = {k: blank() for k in periods}
+    by_model = {k: defaultdict(blank) for k in periods}
+    by_proj = {k: defaultdict(blank) for k in periods}
+    daily = {today - timedelta(days=i): blank() for i in range(29, -1, -1)}
+    unpriced = set()
+    for r in records:
+        if price_for(r["model"]) is None:
+            unpriced.add(r["model"])
+        age = (today - r["day"]).days
+        for k, lim in periods.items():
+            if lim is None or 0 <= age <= lim:
+                add(totals[k], r)
+                add(by_model[k][r["model"]], r)
+                add(by_proj[k][r["project"]], r)
+        if r["day"] in daily:
+            add(daily[r["day"]], r)
+    return dict(totals=totals, by_model=by_model, by_proj=by_proj, daily=daily,
+                unpriced=sorted(unpriced), updated=datetime.now())
+
+
+# ---------------------------------------------------------------- formattazione
+def fmt_int(n):
+    return f"{n:,}".replace(",", ".")
+
+
+def fmt_tok(n):
+    if n >= 1_000_000_000:
+        return f"{n / 1e9:.2f} G".replace(".", ",")
+    if n >= 1_000_000:
+        return f"{n / 1e6:.2f} M".replace(".", ",")
+    if n >= 10_000:
+        return f"{n / 1e3:.1f} k".replace(".", ",")
+    return fmt_int(n)
+
+
+def fmt_cost(c):
+    return "$" + f"{c:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+PERIOD_LABELS = [("today", "Oggi"), ("7d", "Ultimi 7 giorni"),
+                 ("30d", "Ultimi 30 giorni"), ("all", "Sempre")]
+DISCLAIMER = ("Costi stimati con la tabella PRICES in cima allo script "
+              "claude-usage: sono solo indicativi.")
+
+
+def dump(stats):
+    print("== Totali ==")
+    hdr = f"{'Periodo':<18}{'Msg':>8}{'Input':>12}{'Output':>12}{'Cache scr.':>14}{'Cache lett.':>14}{'Costo stim.':>14}"
+    print(hdr)
+    for k, lab in PERIOD_LABELS:
+        t = stats["totals"][k]
+        print(f"{lab:<18}{fmt_int(t['n']):>8}{fmt_tok(t['inp']):>12}{fmt_tok(t['out']):>12}"
+              f"{fmt_tok(t['cw5'] + t['cw1h']):>14}{fmt_tok(t['cr']):>14}{fmt_cost(t['cost']):>14}")
+    for title, key in (("Per modello (sempre)", "by_model"), ("Per progetto (sempre)", "by_proj")):
+        print(f"\n== {title} ==")
+        rows = sorted(stats[key]["all"].items(), key=lambda kv: -kv[1]["cost"])
+        for name, t in rows:
+            print(f"{name:<55.55}{fmt_int(t['n']):>8}{fmt_tok(t['out']):>11}{fmt_cost(t['cost']):>12}")
+    print("\n== Ultimi 30 giorni (costo stimato) ==")
+    for d, t in stats["daily"].items():
+        print(f"{d}  {fmt_int(t['n']):>6} msg  {fmt_cost(t['cost']):>10}")
+    if stats["unpriced"]:
+        print("\nModelli senza prezzo (costo 0):", ", ".join(stats["unpriced"]))
+    print("\n" + DISCLAIMER)
+
+
+# ------------------------------------------------------- limiti abbonamento
+# Stesso endpoint e stessi header usati da Claude Code per `/usage`
+# (verificato nel bundle della CLI). Il token NON va mai stampato o salvato.
+CREDENTIALS = os.path.expanduser("~/.claude/.credentials.json")
+USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+OAUTH_BETA = "oauth-2025-04-20"
+HTTP_TIMEOUT = 8          # secondi
+REFRESH_SECONDS = 60      # cadenza di aggiornamento (GUI ed estensione)
+CACHE_TTL = 50            # sotto questa eta' si riusano i dati gia' scaricati
+BACKOFF_MAX = 1800        # attesa massima dopo 429/403 ripetuti
+
+TOKEN_EXPIRED = "token scaduto: apri Claude Code per rinnovarlo"
+TOKEN_REJECTED = "token rifiutato dal server (401): apri Claude Code per rinnovarlo"
+
+GIORNI = ["lun", "mar", "mer", "gio", "ven", "sab", "dom"]
+GROUP_LABELS = {"session": "Sessione", "weekly": "Settimana", "other": "Altri limiti"}
+# Risposte senza l'elenco `limits`: finestre "storiche" nominate.
+LEGACY_WINDOWS = [
+    ("five_hour", "session", "session", None),
+    ("seven_day", "weekly", "weekly_all", None),
+    ("seven_day_opus", "weekly", "weekly_scoped", "Opus"),
+    ("seven_day_sonnet", "weekly", "weekly_scoped", "Sonnet"),
+    ("seven_day_oauth_apps", "weekly", "weekly_scoped", "App OAuth"),
+    ("seven_day_cowork", "weekly", "weekly_scoped", "Cowork"),
+]
+
+# Stato condiviso tra GUI ed estensione (solo dati di utilizzo e backoff, mai
+# il token): file in $XDG_RUNTIME_DIR (tmpfs, sparisce al logout).
+_mem_state = {}
+
+
+class LimitsError(Exception):
+    pass
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Niente redirect: l'header Authorization non deve finire su altri host."""
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
+def _state_path():
+    d = os.environ.get("XDG_RUNTIME_DIR")
+    return os.path.join(d, "claude-usage-limits.json") if d and os.path.isdir(d) else None
+
+
+def _load_state():
+    p = _state_path()
+    if not p:
+        return dict(_mem_state)
+    try:
+        with open(p, encoding="utf-8") as fh:
+            s = json.load(fh)
+        return s if isinstance(s, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_state(s):
+    _mem_state.clear()
+    _mem_state.update(s)
+    p = _state_path()
+    if not p:
+        return
+    tmp = f"{p}.{os.getpid()}.tmp"
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(s, fh)
+        os.replace(tmp, p)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def _read_oauth():
+    """(token, expiresAt) dal file credenziali di Claude Code; non lo modifica mai."""
+    try:
+        with open(CREDENTIALS, encoding="utf-8") as fh:
+            o = json.load(fh).get("claudeAiOauth") or {}
+    except FileNotFoundError:
+        raise LimitsError("credenziali di Claude Code non trovate: accedi con Claude Code (/login)")
+    except (OSError, ValueError, AttributeError):
+        raise LimitsError("credenziali di Claude Code illeggibili")
+    tok = o.get("accessToken")
+    if not tok or not isinstance(tok, str):
+        raise LimitsError("nessun login Claude.ai in Claude Code: accedi con /login")
+    exp = o.get("expiresAt")
+    if isinstance(exp, (int, float)) and exp / 1000 <= time.time():
+        raise LimitsError(TOKEN_EXPIRED)
+    return tok, exp
+
+
+def _retry_after(headers):
+    v = headers.get("Retry-After") if headers else None
+    try:
+        return max(0, int(float(v)))
+    except (TypeError, ValueError):
+        return None
+
+
+def fetch_limits(max_age=CACHE_TTL):
+    """Scarica i limiti (o riusa dati recenti). Non solleva eccezioni.
+
+    Restituisce dict(ok, error, data, fetched_at): `data` puo' essere l'ultimo
+    dato valido anche quando `error` e' valorizzato (dati non aggiornati).
+    """
+    now = time.time()
+    st = _load_state()
+    res = dict(ok=False, error=None, data=st.get("data"), fetched_at=st.get("fetched_at"))
+    if res["data"] is not None and res["fetched_at"] and 0 <= now - res["fetched_at"] < max_age:
+        res["ok"] = True
+        return res
+    try:
+        tok, exp = _read_oauth()
+    except LimitsError as e:
+        res["error"] = str(e)
+        return res
+    # Stesso token gia' rifiutato con 401: non insistere finche' Claude Code non lo rinnova.
+    if st.get("rejected_exp") is not None and st.get("rejected_exp") == exp:
+        res["error"] = TOKEN_REJECTED
+        return res
+    until = st.get("backoff_until") or 0
+    if until > now:
+        res["error"] = (f"{st.get('backoff_reason') or 'troppe richieste'}: "
+                        f"nuovo tentativo alle {datetime.fromtimestamp(until):%H:%M}")
+        return res
+    req = urllib.request.Request(USAGE_URL, headers={
+        "Authorization": "Bearer " + tok,
+        "anthropic-beta": OAUTH_BETA,
+        "Content-Type": "application/json",
+        "User-Agent": "claude-usage (GNOME)",
+    })
+    del tok
+    try:
+        with _OPENER.open(req, timeout=HTTP_TIMEOUT) as r:
+            body = json.loads(r.read().decode("utf-8"))
+        if not isinstance(body, dict):
+            raise ValueError("non e' un oggetto JSON")
+    except urllib.error.HTTPError as e:
+        code = e.code
+        if code == 401:
+            st["rejected_exp"] = exp
+            res["error"] = TOKEN_REJECTED
+        elif code in (429, 403):
+            fails = int(st.get("fails") or 0) + 1
+            wait = _retry_after(e.headers) or min(60 * 2 ** fails, BACKOFF_MAX)
+            wait = max(wait, REFRESH_SECONDS)
+            reason = ("troppe richieste (HTTP 429)" if code == 429
+                      else "accesso negato (HTTP 403)")
+            st.update(fails=fails, backoff_until=now + wait, backoff_reason=reason)
+            res["error"] = f"{reason}: nuovo tentativo alle {datetime.fromtimestamp(now + wait):%H:%M}"
+        else:
+            res["error"] = f"errore del server (HTTP {code})"
+        _save_state(st)
+        return res
+    except (urllib.error.URLError, OSError, http.client.HTTPException):
+        res["error"] = "offline: impossibile contattare api.anthropic.com"
+        return res
+    except ValueError:
+        res["error"] = "risposta non valida dal server"
+        return res
+    st.update(data=body, fetched_at=now, fails=0, backoff_until=0,
+              backoff_reason=None, rejected_exp=None)
+    _save_state(st)
+    res.update(ok=True, data=body, fetched_at=now)
+    return res
+
+
+def _scope_name(scope):
+    if not isinstance(scope, dict):
+        return None
+    for k in ("model", "surface"):
+        v = scope.get(k)
+        if isinstance(v, dict) and v.get("display_name"):
+            return str(v["display_name"])
+        if isinstance(v, str) and v:
+            return v
+    return None
+
+
+def _row_label(kind, name):
+    if kind == "session":
+        return "Sessione corrente (5 ore)"
+    if kind == "weekly_all":
+        return "Settimanale - tutti i modelli"
+    if kind == "weekly_scoped":
+        return f"Settimanale - {name}" if name else "Settimanale (limitato)"
+    base = kind.replace("_", " ").capitalize() if kind else "Limite"
+    return f"{base} - {name}" if name else base
+
+
+def _num(v):
+    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+
+def parse_limits(data):
+    """Righe ordinate come le manda il server: dict(kind, group, label, percent, resets_at, severity, extra)."""
+    rows = []
+    if not isinstance(data, dict):
+        return rows
+    lim = data.get("limits")
+    if isinstance(lim, list) and lim:
+        for it in lim:
+            if not isinstance(it, dict):
+                continue
+            kind = str(it.get("kind") or "")
+            pct = _num(it.get("percent"))
+            rows.append(dict(kind=kind, group=str(it.get("group") or "other"),
+                             label=_row_label(kind, _scope_name(it.get("scope"))),
+                             percent=pct if pct is not None else 0.0,
+                             resets_at=it.get("resets_at"),
+                             severity=str(it.get("severity") or ""), extra=""))
+    else:
+        for key, group, kind, name in LEGACY_WINDOWS:
+            w = data.get(key)
+            if isinstance(w, dict) and _num(w.get("utilization")) is not None:
+                rows.append(dict(kind=kind, group=group, label=_row_label(kind, name),
+                                 percent=_num(w["utilization"]), resets_at=w.get("resets_at"),
+                                 severity="", extra=""))
+    # Qualsiasi altra finestra con utilizzo e azzeramento (es. limiti in dollari).
+    for key, w in data.items():
+        if key.startswith(("five_hour", "seven_day")) or not isinstance(w, dict):
+            continue
+        u = _num(w.get("utilization"))
+        if u is None or "resets_at" not in w:
+            continue
+        extra = ""
+        lim_d, used_d = _num(w.get("limit_dollars")), _num(w.get("used_dollars"))
+        if lim_d is not None and used_d is not None:
+            extra = f"{fmt_cost(used_d)} di {fmt_cost(lim_d)}"
+        rows.append(dict(kind=key, group="other", label=f"Altro limite ({key})", percent=u,
+                         resets_at=w.get("resets_at"), severity="", extra=extra))
+    eu = data.get("extra_usage")
+    if isinstance(eu, dict) and eu.get("is_enabled") and _num(eu.get("utilization")) is not None:
+        rows.append(dict(kind="extra_usage", group="other", label="Crediti extra (mensili)",
+                         percent=_num(eu["utilization"]), resets_at=None, severity="", extra=""))
+    return rows
+
+
+def level_of(row):
+    """normal / warning / critical, dal server o dalla percentuale."""
+    sev, p = row.get("severity") or "", row.get("percent") or 0
+    if sev in ("critical", "error", "exceeded", "blocked") or p >= 90:
+        return "critical"
+    if sev == "warning" or p >= 75:
+        return "warning"
+    return "normal"
+
+
+def fmt_pct(p):
+    return (f"{p:.0f}" if abs(p - round(p)) < 0.05 else f"{p:.1f}".replace(".", ",")) + "%"
+
+
+def fmt_delta(secs):
+    if secs <= 0:
+        return "a breve"
+    m = int(secs // 60)
+    d, m = divmod(m, 1440)
+    h, m = divmod(m, 60)
+    if d:
+        return f"tra {d} g {h} h"
+    if h:
+        return f"tra {h} h {m} min"
+    return f"tra {max(m, 1)} min"
+
+
+def fmt_reset(iso, now=None):
+    if not iso or not isinstance(iso, str):
+        return ""
+    try:
+        dt = datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone()
+    except ValueError:
+        return ""
+    now = now or datetime.now().astimezone()
+    if dt.date() == now.date():
+        when = f"oggi alle {dt:%H:%M}"
+    elif dt.date() == now.date() + timedelta(days=1):
+        when = f"domani alle {dt:%H:%M}"
+    else:
+        when = f"{GIORNI[dt.weekday()]} {dt:%d/%m} alle {dt:%H:%M}"
+    return f"si azzera {when} ({fmt_delta((dt - now).total_seconds())})"
+
+
+def row_detail(row):
+    parts = [p for p in (fmt_reset(row.get("resets_at")), row.get("extra")) if p]
+    return " - ".join(parts)
+
+
+def grouped_rows(rows):
+    """[(etichetta gruppo, [righe])] nell'ordine del server."""
+    out = []
+    for r in rows:
+        g = GROUP_LABELS.get(r["group"], r["group"].replace("_", " ").capitalize())
+        if out and out[-1][0] == g:
+            out[-1][1].append(r)
+        else:
+            out.append((g, [r]))
+    return out
+
+
+def today_cost():
+    start = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
+    recs, _info = collect(since=start.timestamp())
+    return sum(r["cost"] for r in recs if r["day"] == start.date())
+
+
+def limits_cli(as_json):
+    res = fetch_limits()
+    rows = parse_limits(res["data"]) if res["data"] is not None else []
+    upd = datetime.fromtimestamp(res["fetched_at"]) if res["fetched_at"] else None
+    if as_json:
+        try:
+            cost = today_cost()
+        except Exception:  # noqa - il costo e' accessorio
+            cost = None
+        pick = lambda k: next((r["percent"] for r in rows if r["kind"] == k), None)  # noqa
+        out = dict(
+            ok=res["ok"], error=res["error"],
+            updated=upd.astimezone().isoformat(timespec="seconds") if upd else None,
+            updated_text=f"{upd:%H:%M:%S}" if upd else None,
+            session_percent=pick("session"), weekly_percent=pick("weekly_all"),
+            today_cost=cost, today_cost_text=fmt_cost(cost) if cost is not None else None,
+            rows=[dict(r, group_label=g, percent_text=fmt_pct(r["percent"]),
+                       detail=row_detail(r), level=level_of(r))
+                  for g, rs in grouped_rows(rows) for r in rs],
+        )
+        print(json.dumps(out, ensure_ascii=False))
+        return 0
+    head = "== Limiti dell'abbonamento =="
+    if upd:
+        head += f"  (aggiornato alle {upd:%H:%M:%S}{'' if res['ok'] else ', dati non aggiornati'})"
+    print(head)
+    if res["error"]:
+        print(f"! {res['error']}")
+    for g, rs in grouped_rows(rows):
+        print(f"\n{g}")
+        for r in rs:
+            n = int(round(min(max(r["percent"], 0), 100) / 5))
+            print(f"  {r['label']:<36.36}{fmt_pct(r['percent']):>7}  [{'#' * n}{'.' * (20 - n)}]  "
+                  f"{row_detail(r)}")
+    return 0 if rows else 1
+
+
+# ------------------------------------------------------------------------- GUI
+def run_gui():
+    import gi
+    gi.require_version("Gtk", "4.0")
+    try:
+        gi.require_version("Adw", "1")
+        from gi.repository import Adw
+        HAVE_ADW = True
+    except (ValueError, ImportError):
+        Adw = None
+        HAVE_ADW = False
+    from gi.repository import Gtk, GLib, Gdk
+
+    METRICS = [("cost", "Costo stimato ($)"), ("total", "Token totali"),
+               ("io", "Token input+output"), ("n", "Messaggi")]
+
+    def metric_value(t, m):
+        if m == "cost":
+            return t["cost"]
+        if m == "total":
+            return t["inp"] + t["out"] + t["cw5"] + t["cw1h"] + t["cr"]
+        if m == "io":
+            return t["inp"] + t["out"]
+        return t["n"]
+
+    def metric_fmt(v, m):
+        return fmt_cost(v) if m == "cost" else fmt_tok(int(v))
+
+    def label(text, css=None, xalign=0.0, selectable=False):
+        lb = Gtk.Label(label=text, xalign=xalign)
+        lb.set_selectable(selectable)
+        if css:
+            for c in css.split():
+                lb.add_css_class(c)
+        return lb
+
+    def make_table(headers, rows, first_width=None):
+        grid = Gtk.Grid(column_spacing=18, row_spacing=6)
+        grid.set_margin_top(6)
+        grid.set_margin_bottom(6)
+        grid.set_margin_start(12)
+        grid.set_margin_end(12)
+        for c, h in enumerate(headers):
+            lb = label(h, "heading", 0.0 if c == 0 else 1.0)
+            lb.set_hexpand(c == 0)
+            grid.attach(lb, c, 0, 1, 1)
+        for r, row in enumerate(rows, start=1):
+            for c, v in enumerate(row):
+                lb = label(v, "numeric" if c else None, 0.0 if c == 0 else 1.0)
+                if c == 0:
+                    lb.set_ellipsize(3)  # END
+                    lb.set_max_width_chars(48)
+                    lb.set_tooltip_text(v)
+                grid.attach(lb, c, r, 1, 1)
+        return grid
+
+    def card(title, child, extra=None):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        head = Gtk.Box(spacing=12)
+        head.append(label(title, "title-4"))
+        if extra is not None:
+            extra.set_hexpand(True)
+            extra.set_halign(Gtk.Align.END)
+            head.append(extra)
+        else:
+            head.get_first_child().set_hexpand(True)
+        box.append(head)
+        frame = Gtk.Frame()
+        frame.set_child(child)
+        box.append(frame)
+        return box
+
+    LIMITS_CSS = """
+    progressbar.lim-warning > trough > progress { background-color: var(--warning-bg-color, #e5a50a); }
+    progressbar.lim-critical > trough > progress { background-color: var(--error-bg-color, #e01b24); }
+    """
+
+    class UsageWindow:
+        def __init__(self, app):
+            css = Gtk.CssProvider()
+            css.load_from_string(LIMITS_CSS)
+            Gtk.StyleContext.add_provider_for_display(
+                Gdk.Display.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+            self.stats = None
+            self.loading = False
+            self.period = "30d"
+            self.metric = "cost"
+
+            if HAVE_ADW:
+                self.win = Adw.ApplicationWindow(application=app)
+            else:
+                self.win = Gtk.ApplicationWindow(application=app)
+            self.win.set_title("Claude Usage")
+            self.win.set_default_size(920, 860)
+
+            self.refresh_btn = Gtk.Button(icon_name="view-refresh-symbolic")
+            self.refresh_btn.set_tooltip_text("Aggiorna")
+            self.refresh_btn.connect("clicked", lambda *_: self.on_refresh_clicked())
+            self.spinner = Gtk.Spinner()
+            self.refresh_btn.set_child(Gtk.Image.new_from_icon_name("view-refresh-symbolic"))
+
+            # limiti abbonamento: scheda fissa, aggiornata a parte ogni 60 s
+            self.limits_loading = False
+            self.lim_updated = label("Caricamento...", "dim-label")
+            self.lim_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+            for s in ("start", "end", "top", "bottom"):
+                getattr(self.lim_box, f"set_margin_{s}")(12)
+            limits_card = card("Limiti dell'abbonamento", self.lim_box, self.lim_updated)
+
+            self.content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
+            outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
+            for s in ("start", "end", "top", "bottom"):
+                getattr(outer, f"set_margin_{s}")(18)
+            outer.append(limits_card)
+            outer.append(self.content)
+            clamp_parent = outer
+            if HAVE_ADW:
+                clamp = Adw.Clamp(maximum_size=1000, child=outer)
+                clamp_parent = clamp
+            sw = Gtk.ScrolledWindow(vexpand=True)
+            sw.set_child(clamp_parent)
+            self.sw = sw
+            self.status = label("Caricamento...", "dim-label")
+            self.status.set_margin_start(18)
+            self.status.set_margin_end(18)
+            self.status.set_margin_bottom(8)
+            self.status.set_wrap(True)
+
+            body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+            body.append(sw)
+            body.append(self.status)
+
+            if HAVE_ADW:
+                header = Adw.HeaderBar()
+                header.pack_start(self.refresh_btn)
+                tv = Adw.ToolbarView()
+                tv.add_top_bar(header)
+                tv.set_content(body)
+                self.win.set_content(tv)
+            else:
+                header = Gtk.HeaderBar()
+                header.pack_start(self.refresh_btn)
+                self.win.set_titlebar(header)
+                self.win.set_child(body)
+
+            self.win.present()
+            self.refresh()
+            self.refresh_limits()
+            self.timer = GLib.timeout_add_seconds(REFRESH_SECONDS, self.on_tick)
+            self.win.connect("close-request", self.on_close)
+
+        def on_close(self, *_):
+            if self.timer:
+                GLib.source_remove(self.timer)
+                self.timer = 0
+            return False
+
+        def on_tick(self):
+            self.refresh_limits()
+            self.refresh(quiet=True)  # rilettura incrementale: solo i file cambiati
+            return True
+
+        def on_refresh_clicked(self):
+            self.refresh()
+            self.refresh_limits(max_age=0)
+
+        # -- caricamento in thread
+        def refresh(self, quiet=False):
+            if self.loading:
+                return
+            self.loading = True
+            if not quiet:
+                self.refresh_btn.set_sensitive(False)
+                self.refresh_btn.set_child(self.spinner)
+                self.spinner.start()
+                self.status.set_text("Lettura delle trascrizioni in corso...")
+
+            def work():
+                try:
+                    recs, info = collect()
+                    stats = compute(recs)
+                    stats["info"] = info
+                    stats["count"] = len(recs)
+                    GLib.idle_add(self.done, stats, None, quiet)
+                except Exception as e:  # noqa
+                    GLib.idle_add(self.done, None, e, quiet)
+
+            threading.Thread(target=work, daemon=True).start()
+
+        @staticmethod
+        def signature(stats):
+            t = stats["totals"]
+            return (stats["count"], next(iter(stats["daily"])),
+                    tuple(tuple(sorted(t[k].items())) for k in t))
+
+        def done(self, stats, err, quiet=False):
+            self.loading = False
+            if not quiet:
+                self.spinner.stop()
+                self.refresh_btn.set_child(Gtk.Image.new_from_icon_name("view-refresh-symbolic"))
+                self.refresh_btn.set_sensitive(True)
+            if err:
+                self.status.set_text(f"Errore: {err}")
+                return False
+            old = self.stats
+            self.stats = stats
+            if quiet and old is not None and self.signature(old) == self.signature(stats):
+                self.set_status()  # nulla di nuovo: aggiorna solo l'ora
+                return False
+            adj = self.sw.get_vadjustment()
+            pos = adj.get_value()
+            self.build()
+            if quiet:
+                GLib.idle_add(lambda: adj.set_value(min(pos, adj.get_upper() - adj.get_page_size())) and False)
+            return False
+
+        # -- limiti abbonamento (rete, in thread)
+        def refresh_limits(self, max_age=CACHE_TTL):
+            if self.limits_loading:
+                return
+            self.limits_loading = True
+
+            def work():
+                try:
+                    res = fetch_limits(max_age)
+                except Exception as e:  # noqa - fetch_limits non dovrebbe sollevare
+                    res = dict(ok=False, error=f"errore inatteso: {type(e).__name__}",
+                               data=None, fetched_at=None)
+                GLib.idle_add(self.show_limits, res)
+
+            threading.Thread(target=work, daemon=True).start()
+
+        def show_limits(self, res):
+            self.limits_loading = False
+            c = self.lim_box.get_first_child()
+            while c:
+                n = c.get_next_sibling()
+                self.lim_box.remove(c)
+                c = n
+            rows = parse_limits(res["data"]) if res["data"] is not None else []
+            upd = datetime.fromtimestamp(res["fetched_at"]) if res["fetched_at"] else None
+            if upd and res["ok"]:
+                self.lim_updated.set_text(f"Aggiornato alle {upd:%H:%M:%S}")
+            elif upd:
+                self.lim_updated.set_text(f"Dati non aggiornati (ultimi alle {upd:%H:%M:%S})")
+            else:
+                self.lim_updated.set_text("Nessun dato")
+            if res["error"]:
+                err = label(res["error"], "error heading")
+                err.set_wrap(True)
+                self.lim_box.append(err)
+            if not rows and not res["error"]:
+                self.lim_box.append(label("Nessun limite riportato dal server.", "dim-label"))
+            for g, rs in grouped_rows(rows):
+                self.lim_box.append(label(g, "heading"))
+                for r in rs:
+                    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+                    top = Gtk.Box(spacing=12)
+                    name = label(r["label"])
+                    name.set_hexpand(True)
+                    top.append(name)
+                    top.append(label(fmt_pct(r["percent"]), "numeric heading", 1.0))
+                    box.append(top)
+                    bar = Gtk.ProgressBar()
+                    bar.set_fraction(min(max(r["percent"], 0.0), 100.0) / 100.0)
+                    lvl = level_of(r)
+                    if lvl != "normal":
+                        bar.add_css_class("lim-" + lvl)
+                    box.append(bar)
+                    det = row_detail(r)
+                    if det:
+                        box.append(label(det, "dim-label caption"))
+                    self.lim_box.append(box)
+            return False
+
+        # -- costruzione UI
+        def clear(self):
+            c = self.content.get_first_child()
+            while c:
+                n = c.get_next_sibling()
+                self.content.remove(c)
+                c = n
+
+        def build(self):
+            s = self.stats
+            self.clear()
+
+            # Totali
+            rows = []
+            for k, lab in PERIOD_LABELS:
+                t = s["totals"][k]
+                rows.append([lab, fmt_int(t["n"]), fmt_tok(t["inp"]), fmt_tok(t["out"]),
+                             fmt_tok(t["cw5"] + t["cw1h"]), fmt_tok(t["cr"]),
+                             fmt_cost(t["cost"])])
+            self.content.append(card("Totali", make_table(
+                ["Periodo", "Messaggi", "Input", "Output", "Cache scrittura",
+                 "Cache lettura", "Costo stim."], rows)))
+
+            # Grafico
+            mdd = Gtk.DropDown.new_from_strings([m[1] for m in METRICS])
+            mdd.set_selected([m[0] for m in METRICS].index(self.metric))
+            mdd.connect("notify::selected", self.on_metric)
+            self.chart = Gtk.DrawingArea()
+            self.chart.set_content_height(220)
+            self.chart.set_hexpand(True)
+            self.chart.set_draw_func(self.draw_chart)
+            self.content.append(card("Ultimi 30 giorni", self.chart, mdd))
+
+            # Periodo per le ripartizioni
+            pdd = Gtk.DropDown.new_from_strings([p[1] for p in PERIOD_LABELS])
+            pdd.set_selected([p[0] for p in PERIOD_LABELS].index(self.period))
+            pdd.connect("notify::selected", self.on_period)
+            self.break_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
+            pbar = Gtk.Box(spacing=12)
+            pbar.append(label("Periodo per le ripartizioni:", "dim-label"))
+            pbar.append(pdd)
+            self.content.append(pbar)
+            self.content.append(self.break_box)
+            self.build_breakdowns()
+
+            self.set_status()
+
+        def set_status(self):
+            s = self.stats
+            msg = (f"Statistiche aggiornate alle {s['updated']:%H:%M:%S} (ogni {REFRESH_SECONDS} s) - "
+                   f"{fmt_int(s['count'])} messaggi unici da {fmt_int(s['info']['files'])} file. "
+                   f"{DISCLAIMER}")
+            if s["unpriced"]:
+                msg += " Modelli senza prezzo (costo 0): " + ", ".join(s["unpriced"]) + "."
+            self.status.set_text(msg)
+
+        def build_breakdowns(self):
+            c = self.break_box.get_first_child()
+            while c:
+                n = c.get_next_sibling()
+                self.break_box.remove(c)
+                c = n
+            s = self.stats
+            hdr = ["", "Messaggi", "Input", "Output", "Cache scr.", "Cache lett.", "Costo stim."]
+            for title, key, first in (("Per modello", "by_model", "Modello"),
+                                      ("Per progetto", "by_proj", "Progetto")):
+                data = sorted(s[key][self.period].items(), key=lambda kv: -kv[1]["cost"])
+                rows = [[name, fmt_int(t["n"]), fmt_tok(t["inp"]), fmt_tok(t["out"]),
+                         fmt_tok(t["cw5"] + t["cw1h"]), fmt_tok(t["cr"]), fmt_cost(t["cost"])]
+                        for name, t in data]
+                h = list(hdr)
+                h[0] = first
+                if not rows:
+                    child = label("Nessun dato nel periodo.", "dim-label")
+                    child.set_margin_top(12)
+                    child.set_margin_bottom(12)
+                    child.set_margin_start(12)
+                else:
+                    child = make_table(h, rows)
+                self.break_box.append(card(title, child))
+
+        def on_period(self, dd, _p):
+            self.period = PERIOD_LABELS[dd.get_selected()][0]
+            self.build_breakdowns()
+
+        def on_metric(self, dd, _p):
+            self.metric = METRICS[dd.get_selected()][0]
+            self.chart.queue_draw()
+
+        # -- grafico a barre (Cairo)
+        def draw_chart(self, area, cr, w, h):
+            daily = self.stats["daily"]
+            days = list(daily.keys())
+            vals = [metric_value(daily[d], self.metric) for d in days]
+            fg = area.get_color()
+            if HAVE_ADW:
+                try:
+                    acc = Adw.StyleManager.get_default().get_accent_color_rgba()
+                except Exception:
+                    acc = Gdk.RGBA(); acc.parse("#3584e4")
+            else:
+                acc = Gdk.RGBA(); acc.parse("#3584e4")
+            left, right, top, bottom = 62, 10, 14, 26
+            pw, ph = w - left - right, h - top - bottom
+            vmax = max(vals) if max(vals) > 0 else 1
+            cr.select_font_face("Sans")
+            cr.set_font_size(11)
+
+            def nice(v):
+                import math
+                e = 10 ** math.floor(math.log10(v))
+                for m in (1, 2, 2.5, 5, 10):
+                    if m * e >= v:
+                        return m * e
+                return v
+
+            top_v = nice(vmax)
+            # griglia + asse Y
+            for i in range(5):
+                v = top_v * i / 4
+                y = top + ph - ph * i / 4
+                cr.set_source_rgba(fg.red, fg.green, fg.blue, 0.15)
+                cr.set_line_width(1)
+                cr.move_to(left, y + 0.5)
+                cr.line_to(w - right, y + 0.5)
+                cr.stroke()
+                txt = metric_fmt(v, self.metric) if self.metric != "n" else fmt_int(int(v))
+                if self.metric == "cost":
+                    txt = "$" + (f"{v:.0f}" if top_v >= 10 else f"{v:.2f}".replace(".", ","))
+                ext = cr.text_extents(txt)
+                cr.set_source_rgba(fg.red, fg.green, fg.blue, 0.7)
+                cr.move_to(left - 6 - ext.width, y + 4)
+                cr.show_text(txt)
+            # barre
+            n = len(vals)
+            slot = pw / n
+            bw = max(2, slot * 0.7)
+            for i, (d, v) in enumerate(zip(days, vals)):
+                bh = ph * v / top_v
+                x = left + i * slot + (slot - bw) / 2
+                cr.set_source_rgba(acc.red, acc.green, acc.blue, 0.9)
+                cr.rectangle(x, top + ph - bh, bw, bh)
+                cr.fill()
+                if i % 5 == 0 or i == n - 1:
+                    txt = f"{d.day:02d}/{d.month:02d}"
+                    ext = cr.text_extents(txt)
+                    cr.set_source_rgba(fg.red, fg.green, fg.blue, 0.7)
+                    cr.move_to(x + bw / 2 - ext.width / 2, h - 8)
+                    cr.show_text(txt)
+
+    if HAVE_ADW:
+        Base = Adw.Application
+    else:
+        Base = Gtk.Application
+
+    class App(Base):
+        def __init__(self):
+            super().__init__(application_id=APP_ID)
+
+        def do_activate(self):
+            win = self.props.active_window
+            if win:
+                win.present()
+            else:
+                self.ui = UsageWindow(self)
+
+    return App().run([sys.argv[0]])
+
+
+if __name__ == "__main__":
+    if "--version" in sys.argv:
+        print(f"claude-usage {__version__}")
+    elif "--limits" in sys.argv:
+        sys.exit(limits_cli("--json" in sys.argv))
+    elif "--dump" in sys.argv:
+        recs, info = collect()
+        stats = compute(recs)
+        print(f"File letti: {info['files']}  -  messaggi unici: {len(recs)}\n")
+        dump(stats)
+    else:
+        sys.exit(run_gui())
