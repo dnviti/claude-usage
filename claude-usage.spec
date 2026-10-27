@@ -2,7 +2,7 @@
 %global appid io.github.dnviti.ClaudeUsage
 
 Name:           claude-usage
-Version:        0.1.0
+Version:        0.1.1
 Release:        1%{?dist}
 Summary:        Claude Code usage statistics and subscription limits for GNOME
 
@@ -55,5 +55,9 @@ desktop-file-validate %{buildroot}%{_datadir}/applications/%{appid}.desktop
 %{_datadir}/gnome-shell/extensions/%{uuid}/
 
 %changelog
+* Tue Oct 27 2026 Daniele Viti <8649488+dnviti@users.noreply.github.com> - 0.1.1-1
+- Refresh interval raised from 60 seconds to 30 minutes
+- Remove the "last updated" status label from the app
+
 * Tue Oct 27 2026 Daniele Viti <8649488+dnviti@users.noreply.github.com> - 0.1.0-1
 - Initial release

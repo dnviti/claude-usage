@@ -2,7 +2,7 @@
 //
 // Non legge credenziali e non fa chiamate di rete: esegue
 // `claude-usage --limits --json` (cercato nel PATH, di norma /usr/bin)
-// ogni 60 secondi (in modo asincrono) e mostra il risultato. Tutta la
+// ogni 30 minuti (in modo asincrono) e mostra il risultato. Tutta la
 // logica sta nello script.
 
 import GObject from 'gi://GObject';
@@ -19,7 +19,7 @@ import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 
 Gio._promisify(Gio.Subprocess.prototype, 'communicate_utf8_async');
 
-const INTERVAL_S = 60;
+const INTERVAL_S = 1800;
 const BAR_WIDTH = 260; // px logici (St applica il fattore di scala)
 const DESKTOP_ID = 'io.github.dnviti.ClaudeUsage.desktop';
 

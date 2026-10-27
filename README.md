@@ -20,7 +20,7 @@ Built with Python, GTK4 and libadwaita. Tested on Fedora 44 with GNOME Shell 50
   reset times. Unknown limit types are shown generically.
 - **GNOME Shell extension**: a top-bar indicator with the session percentage;
   its menu lists every limit and today's estimated cost. It refreshes every
-  60 seconds and only runs `claude-usage --limits --json`; it never reads
+  30 minutes and only runs `claude-usage --limits --json`; it never reads
   credentials or talks to the network itself.
 - **Command-line modes**:
 
@@ -41,7 +41,7 @@ Download the RPM from the
 install it:
 
 ```sh
-sudo dnf install ./claude-usage-0.1.0-1.*.noarch.rpm
+sudo dnf install ./claude-usage-0.1.1-1.*.noarch.rpm
 ```
 
 It installs:
@@ -60,7 +60,7 @@ gnome-extensions enable claude-usage@dnviti.github.io
 ### Build the RPM yourself
 
 ```sh
-git archive --prefix=claude-usage-0.1.0/ -o ~/rpmbuild/SOURCES/claude-usage-0.1.0.tar.gz v0.1.0
+git archive --prefix=claude-usage-0.1.1/ -o ~/rpmbuild/SOURCES/claude-usage-0.1.1.tar.gz v0.1.1
 rpmbuild -bb claude-usage.spec
 ```
 

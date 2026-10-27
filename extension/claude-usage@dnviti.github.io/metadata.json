@@ -1,9 +1,9 @@
 {
   "uuid": "claude-usage@dnviti.github.io",
   "name": "Claude Usage",
-  "description": "Claude subscription limits (5-hour session, weekly) and today's estimated cost in the top bar. Data from `claude-usage --limits --json`, refreshed every 60 seconds.",
+  "description": "Claude subscription limits (5-hour session, weekly) and today's estimated cost in the top bar. Data from `claude-usage --limits --json`, refreshed every 30 minutes.",
   "shell-version": ["50"],
   "url": "https://github.com/dnviti/claude-usage",
-  "version": 1,
-  "version-name": "0.1.0"
+  "version": 2,
+  "version-name": "0.1.1"
 }
