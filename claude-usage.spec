@@ -2,7 +2,7 @@
 %global appid io.github.dnviti.ClaudeUsage
 
 Name:           claude-usage
-Version:        0.1.1
+Version:        0.1.2
 Release:        1%{?dist}
 Summary:        Claude Code usage statistics and subscription limits for GNOME
 
@@ -41,8 +41,10 @@ install -pm 0644 extension/%{uuid}/metadata.json \
                  extension/%{uuid}/extension.js \
                  extension/%{uuid}/stylesheet.css \
                  %{buildroot}%{_datadir}/gnome-shell/extensions/%{uuid}/
-install -pm 0644 extension/%{uuid}/icons/claude-usage-symbolic.svg \
+install -pm 0644 extension/%{uuid}/icons/claude-usage.svg \
                  %{buildroot}%{_datadir}/gnome-shell/extensions/%{uuid}/icons/
+install -Dpm 0644 data/icons/hicolor/scalable/apps/%{appid}.svg \
+                  %{buildroot}%{_datadir}/icons/hicolor/scalable/apps/%{appid}.svg
 
 %check
 desktop-file-validate %{buildroot}%{_datadir}/applications/%{appid}.desktop
@@ -52,9 +54,15 @@ desktop-file-validate %{buildroot}%{_datadir}/applications/%{appid}.desktop
 %doc README.md
 %{_bindir}/claude-usage
 %{_datadir}/applications/%{appid}.desktop
+%{_datadir}/icons/hicolor/scalable/apps/%{appid}.svg
 %{_datadir}/gnome-shell/extensions/%{uuid}/
 
 %changelog
+* Sat Oct 31 2026 Daniele Viti <8649488+dnviti@users.noreply.github.com> - 0.1.2-1
+- Show the weekly percentage in the panel when the 5-hour limit is absent
+- Fix a missing session percentage being shown as 0%
+- New Claude starburst icon for the panel and the application
+
 * Tue Oct 27 2026 Daniele Viti <8649488+dnviti@users.noreply.github.com> - 0.1.1-1
 - Refresh interval raised from 60 seconds to 30 minutes
 - Remove the "last updated" status label from the app

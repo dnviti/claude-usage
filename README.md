@@ -18,8 +18,8 @@ Built with Python, GTK4 and libadwaita. Tested on Fedora 44 with GNOME Shell 50
 - **Subscription limits**: current 5-hour session, weekly limits and any other
   window the server reports, with progress bars, warning/critical colours and
   reset times. Unknown limit types are shown generically.
-- **GNOME Shell extension**: a top-bar indicator with the session percentage;
-  its menu lists every limit and today's estimated cost. It refreshes every
+- **GNOME Shell extension**: a top-bar indicator with the session percentage (or the weekly one, marked
+  with a "W", when the server reports no 5-hour limit); its menu lists every limit and today's estimated cost. It refreshes every
   30 minutes and only runs `claude-usage --limits --json`; it never reads
   credentials or talks to the network itself.
 - **Command-line modes**:
@@ -41,13 +41,14 @@ Download the RPM from the
 install it:
 
 ```sh
-sudo dnf install ./claude-usage-0.1.1-1.*.noarch.rpm
+sudo dnf install ./claude-usage-0.1.2-1.*.noarch.rpm
 ```
 
 It installs:
 
 - `/usr/bin/claude-usage`
 - `/usr/share/applications/io.github.dnviti.ClaudeUsage.desktop`
+- `/usr/share/icons/hicolor/scalable/apps/io.github.dnviti.ClaudeUsage.svg`
 - `/usr/share/gnome-shell/extensions/claude-usage@dnviti.github.io/`
 
 Then enable the top-bar extension (on Wayland, log out and back in first so
@@ -60,7 +61,7 @@ gnome-extensions enable claude-usage@dnviti.github.io
 ### Build the RPM yourself
 
 ```sh
-git archive --prefix=claude-usage-0.1.1/ -o ~/rpmbuild/SOURCES/claude-usage-0.1.1.tar.gz v0.1.1
+git archive --prefix=claude-usage-0.1.2/ -o ~/rpmbuild/SOURCES/claude-usage-0.1.2.tar.gz v0.1.2
 rpmbuild -bb claude-usage.spec
 ```
 

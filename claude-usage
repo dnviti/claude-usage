@@ -19,7 +19,7 @@ Uso:
     claude-usage --version        stampa la versione
 """
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 # ---------------------------------------------------------------------------
 # TABELLA PREZZI (MODIFICABILE) - USD per milione di token.
@@ -504,7 +504,7 @@ def parse_limits(data):
             pct = _num(it.get("percent"))
             rows.append(dict(kind=kind, group=str(it.get("group") or "other"),
                              label=_row_label(kind, _scope_name(it.get("scope"))),
-                             percent=pct if pct is not None else 0.0,
+                             percent=pct if pct is not None else 0.0, known=pct is not None,
                              resets_at=it.get("resets_at"),
                              severity=str(it.get("severity") or ""), extra=""))
     else:
@@ -610,7 +610,8 @@ def limits_cli(as_json):
             cost = today_cost()
         except Exception:  # noqa - il costo e' accessorio
             cost = None
-        pick = lambda k: next((r["percent"] for r in rows if r["kind"] == k), None)  # noqa
+        pick = lambda k: next((r["percent"] for r in rows  # noqa
+                               if r["kind"] == k and r.get("known", True)), None)
         out = dict(
             ok=res["ok"], error=res["error"],
             updated=upd.astimezone().isoformat(timespec="seconds") if upd else None,

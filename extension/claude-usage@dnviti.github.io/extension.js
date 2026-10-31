@@ -36,7 +36,7 @@ class ClaudeUsageIndicator extends PanelMenu.Button {
 
         const box = new St.BoxLayout({style_class: 'panel-status-menu-box'});
         box.add_child(new St.Icon({
-            gicon: Gio.icon_new_for_string(`${ext.path}/icons/claude-usage-symbolic.svg`),
+            gicon: Gio.icon_new_for_string(`${ext.path}/icons/claude-usage.svg`),
             style_class: 'system-status-icon',
         }));
         this._panelLabel = new St.Label({
@@ -97,14 +97,16 @@ class ClaudeUsageIndicator extends PanelMenu.Button {
     _render(d) {
         this._rowsSection.removeAll();
         const rows = Array.isArray(d.rows) ? d.rows : [];
-        const session = rows.find(r => r.kind === 'session');
-
-        const pct = d.session_percent;
-        this._panelLabel.text = typeof pct === 'number' ? `${Math.round(pct)}%` : '–';
+        // Percentuale nella barra: sessione (5 ore); se manca, quella settimanale ("W").
+        const hasSession = typeof d.session_percent === 'number';
+        const pct = hasSession ? d.session_percent : d.weekly_percent;
+        const shown = rows.find(r => r.kind === (hasSession ? 'session' : 'weekly_all'));
+        this._panelLabel.text = typeof pct === 'number'
+            ? `${hasSession ? '' : 'W '}${Math.round(pct)}%` : '–';
         for (const lvl of ['warning', 'critical'])
             this._panelLabel.remove_style_class_name(`claude-usage-${lvl}`);
-        if (session && session.level !== 'normal')
-            this._panelLabel.add_style_class_name(`claude-usage-${session.level}`);
+        if (typeof pct === 'number' && shown && shown.level !== 'normal')
+            this._panelLabel.add_style_class_name(`claude-usage-${shown.level}`);
         if (d.error && !d.ok)
             this._panelLabel.text += '!';
 
